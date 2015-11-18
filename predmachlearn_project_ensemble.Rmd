@@ -1,0 +1,304 @@
+---
+title: "predmachlearn project assignment"
+author: "jbonsak"
+date: "November 2015"
+output: html_document
+---
+##Summary   
+The goal here is to predict in which way dumbbell lifts are performed. The data are gathered from sensors worn by six individuals during exercise. I chose (for fun and learning) to blend three methods to produce an ensemble model. It turned out good enough to predict the 20 cases correctly, but surely with plenty of room for further tuning. 
+
+Approach summary:  
+1. Split training dataset into ensemble, blending and testing  
+2. Train three methods (rf, treebag and gbm) on the ensemble data using repeated cross validation  
+3. Predict with all three on both blending and testing data (one run) and store those predictions  
+4. Train a final ensemble model on the blending data (using the three predictions as added predictors)  
+5. Predict once using the final model on the testing data (also with the tree predictions added)  
+  
+The estimated **out of sample error rate** I ended up with from this last step was **0.69%**. 
+  
+  
+##Download, read, explore and prepare data for analysis  
+```{r libraries, message=FALSE, warning=FALSE, quietly=TRUE, results='hide'}
+library(caret)
+library(randomForest)
+library(foreach)
+library(doParallel)
+library(rpart)
+library(e1071)
+library(gbm)
+library(ipred)
+library(plyr)
+library(dplyr)
+```
+
+**Download data** kindly provided by [Groupware in Brazil](http://groupware.les.inf.puc-rio.br/har) and documented [here](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf).
+```{r download_data}
+# Get training data for supervised learning
+urlTrain <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv?accessType=DOWNLOAD"
+fileTrain <- "pml-training.csv"
+if (!file.exists(fileTrain)) { download.file( url = urlTrain, destfile = fileTrain, mode = "wb") }  # Windows OS
+
+# Get unlabeled test data set
+urlTest = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv?accessType=DOWNLOAD"
+fileTest <- "pml-testing.csv"
+if (!file.exists(fileTest)) { download.file( url = urlTest, destfile = fileTest, mode = "wb") } 
+```
+
+**Read datasets**, impute empty cells and #DIV/0! to NA, remove any leading or trailing white space.
+```{r load_data}
+na.strings <- c("NA","", "NaN", "Inf", "#DIV/0!")
+trainRaw <- read.csv2(fileTrain, sep=",", stringsAsFactors = TRUE, na.strings = na.strings, strip.white = TRUE, dec = ".")
+testRaw <- read.csv2(fileTest, sep=",", stringsAsFactors = TRUE, na.strings = na.strings, strip.white = TRUE, dec = ".")
+
+dim(trainRaw)  # 160 columns
+train <- trainRaw
+test <- testRaw
+```
+
+Sensors were placed on the dumbbell, glove, armband and a lumbar belt. We have Euler angles (xyz) data for the sensors. In addition, we have data for gyro and magnetometer acceleration, variance, and extreme positions to throw into our machine learning.
+
+**Drop columns** with more than 95% missing values, and the first eight columns which I consider information columns without relevance in this prediction context. An exeption is made for the timestamp, where I keep the hour (11, 13, 14 and 17) just in case that has any predictive power. Also, remove near-zero variance columns, as they are potentially problematic predictors for the models I will use.  
+
+```{r manual_preprocessing}
+# Empty or very close to empty columns (some columns are only populated for new time window observation rows)
+emptyishColumns <- names(train[, colSums(is.na(train)) > nrow(train) * 0.95] )
+train <- train[, -which(names(train) %in% emptyishColumns)]
+dim(train)
+
+# Time of day (hour) column added
+train$hour <- as.numeric(format(as.POSIXct(train$cvtd_timestamp, format="%d/%m/%Y %H:%M"), "%H"))
+test$hour <- as.numeric(format(as.POSIXct(test$cvtd_timestamp, format="%d/%m/%Y %H:%M"), "%H"))
+
+# Columns X, user name, time stamps and time window columns
+infoColumns <- 0:7
+train <- train[, -infoColumns]
+dim(train)
+
+# No columns found to have too low variance
+nzvColumns <- nearZeroVar(train)
+if (length(nzvColumns) > 0) { ## Important check, otherwise train & test are emptied if nzvColumns is empty
+        train <- train[, -nzvColumns] 
+        }
+dim(train)
+
+# Also those with very high correlation, careful not to cut too many away
+corTrain <- cor(train[sapply(train, is.numeric)])  ## Only check numeric columns
+corColumns <- findCorrelation(corTrain, cutoff = 0.90) ## Simplified way of finding the columns to remove
+if (length(corColumns) > 0) { 
+        train <- train[, -corColumns] 
+        }
+dim(train)
+```
+  
+Down to 47 variables now. At this stage, a more thorough study could apply principal component analysis, or check for linear dependencies, assess the need to center/scale data and look for other ways to transform predictors. 
+
+
+**Hold out subset** of training data for model testing through cross-validation. Using an ensemble approach blending the models. Ensemble concept provided by [Manuel Amunategui](http://amunategui.github.io/blending-models/).
+```{r split_data}
+set.seed(2015) 
+
+# 60% to the ensemble data 
+inEnsemble <- createDataPartition(y=train$classe, p=0.6, list=FALSE) 
+ensembleData <- train[inEnsemble, ]
+rest <- train[-inEnsemble, ]
+
+# 20% to the blender data
+inBlend <- createDataPartition(y=rest$classe, p=0.5, list=FALSE) 
+blendingData <- rest[inBlend, ]
+
+# And the last 20% to the testing data
+testingData <- rest[-inBlend, ]
+
+dim(ensembleData)
+dim(blendingData)
+dim(testingData)
+
+labelName <- "classe"
+predictors <- names(ensembleData)[names(ensembleData) != labelName]
+```
+
+
+
+##Train and evaluate several models  
+
+Fitting a simple decision tree model with *train(...method="rpart"...)* returned an accuracy of ~0.50. It's a start, which could be improved quite a bit with tuning and using the [tree](https://cran.r-project.org/web/packages/tree/index.html) package, but let us see what the darker boxes of ML can do.
+
+Below I train models using three different methods and using cross validation. The three methods picked from the [jungle](http://artax.karlin.mff.cuni.cz/r-help/library/caret/html/train.html) of options are bagging (treebag), random forests (rf) and boosted trees (gbm). I also tried support vector machines (svmRadial), but with poor results. 
+
+First set up a **trainControl** containing seeds to be used by the parallel workers. This approach (as opposed to just setting an overall seed) is needed to ensure full reproducibility when cross-validating models using doParallel. Thanks to [Jaehyeon Kim](http://jaehyeon-kim.github.io/r/2015/05/30/Setup-Random-Seeds-on-Caret-Package/) for showing this technique.
+```{r cross_val_for_doParallel}
+# Thanks to Jaehyeon Kim - full code at
+# http://jaehyeon-kim.github.io/r/2015/05/30/Setup-Random-Seeds-on-Caret-Package/
+
+# control variables for parallel processed repeated cross validation 
+numbers <- 10
+repeats <- 5
+
+set.seed(1234)
+
+cvSeeds <- vector(mode = "list", length = numbers+repeats)
+cvSeeds <- lapply(cvSeeds, function(x) sample.int(n = 100000, size = numbers+repeats ))
+cvSeeds[[length(cvSeeds) + 1]] <- sample.int(n = 100000, size = 1)
+
+# trainControl for cross validation to be used in train()
+cvCtrl <- trainControl(method = "repeatedcv", number = numbers, classProbs = TRUE,
+                       savePredictions = TRUE, seeds = cvSeeds)
+```
+  
+  
+A function to remove all potentially problematic **foreach leftovers** after stopping and unregistering a doParallel cluster. I had issues with that during testing. Thanks to Steve Weston in this [Stack Overflow answer](http://stackoverflow.com/a/25110203).
+```{r functions}
+unregister <- function() { 
+  env <- foreach:::.foreachGlobals 
+  rm(list=ls(name=env), pos=env)
+}
+```
+  
+  
+Now **train the models** using the ensemble data:
+```{r backend_cluster, cache=TRUE}
+# train random forest model (dig deep into rf: https://github.com/glouppe/phd-thesis)
+cl <- makeCluster(detectCores()) 
+registerDoParallel(cl)
+set.seed(1)
+
+modFitRf <- train(ensembleData[,predictors], ensembleData[,labelName],
+                  method = "rf",
+                  tuneGrid = expand.grid(mtry = seq(1, 2 * as.integer(sqrt(ncol(ensembleData) - 1)), by = 1)),
+                  trControl = cvCtrl)
+stopCluster(cl); unregister()
+
+# train treebag model
+cl <- makeCluster(detectCores()) 
+registerDoParallel(cl)
+set.seed(1)
+modFitTreebag <- train(ensembleData[,predictors], ensembleData[,labelName],
+                       method = "treebag", 
+                       trControl = cvCtrl) 
+stopCluster(cl); unregister()
+
+# train gbm model 
+set.seed(1)
+modFitGbm <- train(ensembleData[,predictors], ensembleData[,labelName],
+                   method = "gbm",
+                   distribution = "multinomial",
+                   trControl = cvCtrl,
+                   verbose = FALSE)
+```
+  
+  
+Accuracy for these individual models:
+```{r individual_model_accuracy}
+predRf <- predict(modFitRf, testingData[, predictors])
+predTreebag <- predict(modFitTreebag, testingData[, predictors])
+predGbm <- predict(modFitGbm, testingData[, predictors])
+
+confRf <- confusionMatrix(predRf, testingData$classe)
+confTreebag <- confusionMatrix(predTreebag, testingData$classe)
+confGbm <- confusionMatrix(predGbm, testingData$classe)
+
+confRf$overall[1] 
+confTreebag$overall[1]
+confGbm$overall[1] 
+```
+  
+These statistics show the random forest model to be the slightly better one. Let's see if a blending of the three can produce an even better result. This is by no means needed to produce the right predictions in this case, but I do this for learning how to do it and for future reference - maybe a strategy for you and me to climb a Kaggle leaderboard? 
+  
+  
+##Run models on both blending and testing data
+  
+Here we harvest the predictions and add them back to the data.
+```{r predictions_and_harvesting}
+blendingData$rf_PROB <- predict(object=modFitRf, blendingData[, predictors])
+blendingData$treebag_PROB <- predict(object=modFitTreebag, blendingData[, predictors])
+blendingData$gbm_PROB <- predict(object=modFitGbm, blendingData[, predictors])
+
+testingData$rf_PROB <- predict(object=modFitRf, testingData[, predictors])
+testingData$treebag_PROB <- predict(object=modFitTreebag, testingData[, predictors])
+testingData$gbm_PROB <- predict(object=modFitGbm, testingData[, predictors])
+
+test$rf_PROB <- predict(object=modFitRf, test[, predictors])
+test$treebag_PROB <- predict(object=modFitTreebag, test[, predictors])
+test$gbm_PROB <- predict(object=modFitGbm, test[, predictors])
+```
+
+  
+##Train a final blending model  
+  
+Using one of the methods, train a final blending model on the old data and the new predictions from the previous step.
+```{r final_backend_cluster, cache=TRUE}
+predictors <- names(blendingData)[names(blendingData) != labelName] # Include predictions as predictors
+
+cl <- makeCluster(detectCores()) 
+registerDoParallel(cl)
+set.seed(1)
+
+modFitFinal <- train(blendingData[,predictors], blendingData[,labelName],
+                     method = "treebag", 
+                     trControl = cvCtrl) 
+```
+  
+Then run the final model once on the testing data.
+```{r final_prediction}
+predFinal <- predict(modFitFinal, testingData[, predictors])
+confFinal <- confusionMatrix(predFinal, testingData$classe)
+confFinal$overall[1]
+```
+With help from each other, the models combined increased the accuracy of the blended final model. In retrospective, I see that benchmark model fits which I ran with for example just random forests on 75% of the data actually produced higher accuracy, but not significantly higher. So I stick with the blended model.
+
+
+##Out of sample error estimation
+With the final blended treebag+rf+gbm method, the estimated out of sample error is (1 - accuracy):
+```{r OOS_error}
+paste(round((1- sum(predFinal == testingData$classe)/length(predFinal)) * 100, 2), "%")
+```
+  
+  
+##Predict the 20 cases in pml-testing.csv
+```{r predict_20_cases}
+final <- predict(modFitFinal, test[, predictors])
+final
+```
+
+
+##Output files for submission
+```{r output_20_txt_files}
+A <- as.list(as.character(final))
+for (i in 1:20) { write.table(A[i], file=paste0("problem_id_", i, ".txt"), quote=F, row.names=F, col.names=F) }
+```
+  
+  
+  
+  
+
+#Appendix
+
+##Exploratory graph
+
+```{r eda_graph}
+q <- qplot(classe, data=train, xlab="classe", fill=classe) 
+q <- q + scale_fill_brewer(palette="Set2",
+                           name="classe", 
+                           labels=c("A - Perfectly performed",
+                                    "B - Elbow too much forward",
+                                    "C - Lifting only halfway",
+                                    "D - Lowering only halfway",
+                                    "E - Hips too much forward")
+                      )
+print(q)
+
+```
+  
+Although A is dominant, the number of each error type B-E is high enough not to require any weighting.
+
+
+##Confusion matrix for the final model
+```{r final_conf_matrix}
+confFinal
+```
+
+
+
+
+
+
